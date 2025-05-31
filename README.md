@@ -39,16 +39,14 @@
 - 「今月の貢献者紹介」機能の開発
 - 優秀な受講生を称える表彰機能の実装
 
----
 
-## ⚙️ 技術構成
+##  技術構成
 
 - Python（FastAPI, Slack Bolt）
 - ngrok（ローカルサーバの外部公開）
 - dotenv（環境変数管理）
 - Hugging Face 
 
----
 
 ##  セットアップ手順
 
@@ -58,17 +56,18 @@
 cd chatbot_project
 python -m venv chatbot
 source chatbot/bin/activate
+```
 
 2. ライブラリインストール
-
+```
 pip install -r requirements.txt
-
+```
 .env ファイルの設定
-
+```
 SLACK_BOT_TOKEN=your-slack-bot-token
 SLACK_SIGNING_SECRET=your-slack-signing-secret
 NGROK_TOKEN=your-ngrok-token
 HUGGINGFACE_TOKEN=your-huggingface-token  # 今後使用予定
-
+```
 
 
