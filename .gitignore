@@ -2,3 +2,8 @@ chatbot/
 .env
 hello_world.py
 whats_up.py
+fine_tuned_model
+results/
+slack_messages_realstic_10k.csv
+user_counts.db
+simple_bot.py
