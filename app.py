@@ -1,321 +1,376 @@
 import os
-from fastapi import FastAPI, Request, APIRouter, HTTPException
-from slack_bolt import App
-from slack_bolt.adapter.fastapi import SlackRequestHandler
-from dotenv import load_dotenv
-from pyngrok import ngrok
-import uvicorn
-from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import sqlite3
+from datetime import datetime
 import torch
-from transformers import pipeline
-import time
-import traceback
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
+from transformers import pipeline, AutoTokenizer, BertForSequenceClassification
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from slack_bolt import App as BoltApp
+from slack_bolt.adapter.fastapi import SlackRequestHandler
+from slack_sdk import WebClient
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from dotenv import load_dotenv
 
+# -----------------------------------------------------------------------------
+# 1) 環境変数読み込み
+# -----------------------------------------------------------------------------
 # ---設定---
 # モデルの設定
-MODEL_NAME = "google/gemma-2-2b-jpn-it"  
+MODEL_NAME = "lxyuan/distilbert-base-multilingual-cased-sentiments-student" 
 print(f"モデル名: {MODEL_NAME}")
-# .envから環境変数を読み込む
+
 load_dotenv()
+SLACK_BOT_TOKEN      = os.getenv("SLACK_BOT_TOKEN")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+NGROK_TOKEN          = os.getenv("NGROK_TOKEN")
+REPORT_CHANNEL_ID    = os.getenv("REPORT_CHANNEL_ID")
 
-# --- トークンの取得 ---
-SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")
-HUGGINGFACE_TOKEN = os.environ.get("HUGGINGFACE_TOKEN")  
+assert SLACK_BOT_TOKEN, "SLACK_BOT_TOKEN が設定されていません"
+assert SLACK_SIGNING_SECRET, "SLACK_SIGNING_SECRET が設定されていません"
+assert REPORT_CHANNEL_ID, "REPORT_CHANNEL_ID が設定されていません"
 
-# ---モデル設定クラス---
-class Config:
-    def __init__(self, model_name=MODEL_NAME):
-        self.MODEL_NAME = model_name
+# Slack WebClient (レポート送信用)
+web_client = WebClient(token=SLACK_BOT_TOKEN)
 
-config = Config(MODEL_NAME)
-
-fastapi_app = FastAPI(
-    title="Slack Bot with FastAPI",
-    description="A simple Slack bot using FastAPI and Slack Bolt.",
-    version="1.0.0",
-)
-
-# --- FastAPIの設定 ---
-router = APIRouter(prefix="/slack")
-
-@router.post("/events")
-async def slack_events(request: Request):
-    payload = await request.json()
-    if payload.get("type") == "url_verification":
-        return JSONResponse(content={"challenge": payload["challenge"]})
-    return await app_handler.handle(request)
-
-fastapi_app.include_router(router)
-
-# CORSミドルウェアの設定
-fastapi_app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 必要に応じて制限
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---データモデル定義---
-class Message(BaseModel):
-    text: str
-    user: str
-
-# 直接プロンプトを使用した簡略化されたリクエスト
-class SimpleGenerationRequest(BaseModel):
-    prompt: str
-    max_new_tokens: Optional[int] = 512
-    do_sample: Optional[bool] = True
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 0.9
-
-class GenerationResponse(BaseModel):
-    generated_text: str
-    response_time: float
-
-# --- モデル関連の関数 ---
-# モデルのグローバル変数
-model = None
-
+# -- モデルロード----
 def load_model():
-    """推論用のLLMモデルを読み込む"""
-    global model  # グローバル変数を更新するために必要
+    """
+    Hugging Face Transformers の pipeline を使ってモデルをロードする。
+    モデル名はグローバル変数 MODEL_NAME から取得。
+    """
+    global model
     try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"使用デバイス: {device}")
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+
+        print(f"使用するデバイス: {device}")
         pipe = pipeline(
-            "text-generation",
-            model=config.MODEL_NAME,
-            model_kwargs={"torch_dtype": torch.bfloat16}, 
-            device=device
+            "text-classification",
+            model=MODEL_NAME,
+            device=device,
         )
-        print(f"モデル '{config.MODEL_NAME}' の読み込みに成功しました")
-        model = pipe  # グローバル変数を更新
+        print(f"モデル {MODEL_NAME} をロードしました。") 
+        model = pipe
         return pipe
     except Exception as e:
-        error_msg = f"モデル '{config.MODEL_NAME}' の読み込みに失敗: {e}"
-        print(error_msg)
-        traceback.print_exc()  # 詳細なエラー情報を出力
+        print(f"モデル{MODEL_NAME}のロードに失敗しました: {e}")
         return None
 
-def extract_assistant_response(outputs, user_prompt):
-    """モデルの出力からアシスタントの応答を抽出する"""
-    assistant_response = ""
+# === ファインチューニング済み禁止判定モデルのロード ===
+def load_finetuned_prohibited_model():
+    """
+    ファインチューニング済みの禁止判定モデルをロードする。
+    戻り値: tokenizer, model
+    """
     try:
-        if outputs and isinstance(outputs, list) and len(outputs) > 0 and outputs[0].get("generated_text"):
-            generated_output = outputs[0]["generated_text"]
-            
-            if isinstance(generated_output, list):
-                # メッセージフォーマットの場合
-                if len(generated_output) > 0:
-                    last_message = generated_output[-1]
-                    if isinstance(last_message, dict) and last_message.get("role") == "assistant":
-                        assistant_response = last_message.get("content", "").strip()
-                    else:
-                        # 予期しないリスト形式の場合は最後の要素を文字列として試行
-                        print(f"警告: 最後のメッセージの形式が予期しないリスト形式です: {last_message}")
-                        assistant_response = str(last_message).strip()
-
-            elif isinstance(generated_output, str):
-                # 文字列形式の場合
-                full_text = generated_output
-                
-                # 単純なプロンプト入力の場合、プロンプト後の全てを抽出
-                if user_prompt:
-                    prompt_end_index = full_text.find(user_prompt)
-                    if prompt_end_index != -1:
-                        prompt_end_pos = prompt_end_index + len(user_prompt)
-                        assistant_response = full_text[prompt_end_pos:].strip()
-                    else:
-                        # 元のプロンプトが見つからない場合は、生成されたテキストをそのまま返す
-                        assistant_response = full_text
-                else:
-                    assistant_response = full_text
-            else:
-                print(f"警告: 予期しない出力タイプ: {type(generated_output)}")
-                assistant_response = str(generated_output).strip()  # 文字列に変換
-
+        tokenizer = AutoTokenizer.from_pretrained("fine_tuned_model")
+        model = BertForSequenceClassification.from_pretrained("fine_tuned_model")
+        model.eval()
+        print("ファインチューニング済みモデルをロードしました。")
+        return tokenizer, model
     except Exception as e:
-        print(f"応答の抽出中にエラーが発生しました: {e}")
-        traceback.print_exc()
-        assistant_response = "応答の抽出に失敗しました。"  # エラーメッセージを設定
+        print(f"ファインチューニングモデルのロードに失敗しました: {e}")
+        return None, None
 
-    if not assistant_response:
-        print("警告: アシスタントの応答を抽出できませんでした。完全な出力:", outputs)
-        # デフォルトまたはエラー応答を返す
-        assistant_response = "応答を生成できませんでした。"
-
-    return assistant_response
-
-# --- FastAPIエンドポイント定義 ---
-@fastapi_app.on_event("startup")
-async def startup_event():
-    """起動時にモデルを初期化"""
-    load_model_task()  # バックグラウンドではなく同期的に読み込む
-    if model is None:
-        print("警告: 起動時にモデルの初期化に失敗しました")
-    else:
-        print("起動時にモデルの初期化が完了しました。")
-
-@fastapi_app.get("/")
-async def root():
-    """基本的なAPIチェック用のルートエンドポイント"""
-    return {"status": "ok", "message": "Local LLM API is runnning"}
-
-@fastapi_app.get("/health")
-async def health_check():
-    """ヘルスチェックエンドポイント"""
-    global model
-    if model is None:
-        return {"status": "error", "message": "No model loaded"}
-
-    return {"status": "ok", "model": config.MODEL_NAME}
-
-# 簡略化されたエンドポイント
-@fastapi_app.post("/generate", response_model=GenerationResponse)
-async def generate_simple(request: SimpleGenerationRequest):
-    """単純なプロンプト入力に基づいてテキストを生成"""
-    global model
-
-    if model is None:
-        print("generateエンドポイント: モデルが読み込まれていません。読み込みを試みます...")
-        load_model_task()  # 再度読み込みを試みる
-        if model is None:
-            print("generateエンドポイント: モデルの読み込みに失敗しました。")
-            raise HTTPException(status_code=503, detail="モデルが利用できません。後でもう一度お試しください。")
-
-    try:
-        # 日本語での応答を促すプロンプトを追加
-        system_instruction = "あなたは日本語のAIアシスタントです。：\n"
-        final_prompt = system_instruction + request.prompt
-
-        start_time = time.time()
-        print(f"シンプルなリクエストを受信: prompt={final_prompt[:100]}..., max_new_tokens={request.max_new_tokens}")  # 長いプロンプトは切り捨て
-
-        # プロンプトテキストで直接応答を生成
-        print("モデル推論を開始...")
-        outputs = model(
-            final_prompt,
-            max_new_tokens=request.max_new_tokens,
-            do_sample=request.do_sample,
-            temperature=request.temperature,
-            top_p=request.top_p,
-        )
-        print("モデル推論が完了しました。")
-
-        # アシスタント応答を抽出
-        assistant_response = extract_assistant_response(outputs, final_prompt)
-        print(f"抽出されたアシスタント応答: {assistant_response[:100]}...")  # 長い場合は切り捨て
-
-        end_time = time.time()
-        response_time = end_time - start_time
-        print(f"応答生成時間: {response_time:.2f}秒")
-
-        return GenerationResponse(
-            generated_text=assistant_response,
-            response_time=response_time
-        )
-
-    except Exception as e:
-        print(f"シンプル応答生成中にエラーが発生しました: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"応答の生成中にエラーが発生しました: {str(e)}")
-
+finetuned_tokenizer, finetuned_model = load_finetuned_prohibited_model()
+      
 def load_model_task():
-    """モデルを読み込むバックグラウンドタスク"""
+    """
+    非同期でモデルをロードするタスク。
+    FastAPI の起動時に呼び出される。
+    """
     global model
-    print("load_model_task: モデルの読み込みを開始...")
-    # load_model関数を呼び出し、結果をグローバル変数に設定
-    loaded_pipe = load_model()
-    if loaded_pipe:
-        model = loaded_pipe  # グローバル変数を更新
-        print("load_model_task: モデルの読み込みが完了しました。")
+    model = load_model()
+    if model:
+        print("モデルロード成功")
     else:
-        print("load_model_task: モデルの読み込みに失敗しました。")
+        print("モデルロード失敗")
 
-print("FastAPIエンドポイントを定義しました。")
+# -----------------------------------------------------------------------------
+# 2) 禁止判定関数
+# -----------------------------------------------------------------------------
 
-# --- ngrokでAPIサーバーを実行する関数 ---
-def run_with_ngrok(port=8501):
-    """ngrokでFastAPIアプリを実行"""
+def is_prohibited(text: str) -> bool:
+    """
+    ファインチューニング済みの禁止判定モデルを使って、テキストが禁止行為かどうかを判定する。
+    戻り値: True なら禁止行為、False なら許可
+    """
+    global finetuned_tokenizer, finetuned_model
+    if finetuned_tokenizer is None or finetuned_model is None:
+        print("禁止判定モデルが利用できません")
+        return False
+    try:
+        inputs = finetuned_tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=128)
+        with torch.no_grad():
+            outputs = finetuned_model(**inputs)
+            probs = torch.softmax(outputs.logits, dim=1)
+            print(f"禁止判定結果: {probs}")  # デバッグ用に確率を表示
+            return probs[0, 1].item() > 0.60
+    except Exception as e:
+        print(f"禁止判定中にエラー: {e}")
+        return False
 
-    ngrok_token = os.environ.get("NGROK_TOKEN")
-    if not ngrok_token:
-        print("Ngrok認証トークンが'NGROK_TOKEN'環境変数に設定されていません。")
-        try:
-            print("Colab Secrets(左側の鍵アイコン)で'NGROK_TOKEN'を設定することをお勧めします。")
-            ngrok_token = input("Ngrok認証トークンを入力してください (https://dashboard.ngrok.com/get-started/your-authtoken): ")
-        except EOFError:
-            print("\nエラー: 対話型入力が利用できません。")
-            print("Colab Secretsを使用するか、ノートブックセルで`os.environ['NGROK_TOKEN'] = 'あなたのトークン'`でトークンを設定してください")
-            return
+def llm_based_classify(text: str) -> str:
+    global model
+    if model is None:
+        load_model_task()  # モデルをロード
+        if model is None:
+            print("モデルロード失敗")
+            raise HTTPException(status_code=503, detail="モデルが利用できません。後でもう一度お試しください。")
+    try:
+        print(f"分類を開始...", text[:50] + "...")  # デバッグ用にテキストの一部を表示
+        result = model(text)
+        label = result[0]['label']  # モデルの出力からラベルを取得
+        score = result[0]['score']  # スコアも取得（必要に応じて）
+        print(f"分類結果: {label}, スコア: {score:.4f}")  # デバッグ用にスコアを表示
+        print(f"分類が完了しました")
 
-    if not ngrok_token:
-        print("エラー: Ngrok認証トークンを取得できませんでした。中止します。")
+        # 生成されたテキストからポジティブ/その他を判定
+        if label == "positive" and score > 0.7:  # スコアが高い場合のみポジティブとする
+            return "positive"
+        else:
+            return "other"
+    except Exception as e:
+        print(f"分類中にエラーが発生しました: {e}")
+        raise HTTPException(status_code=500, detail="分類処理中にエラーが発生しました。後でもう一度お試しください。")
+
+# -----------------------------------------------------------------------------
+# 3) SQLite データベース初期化・ヘルパー
+# -----------------------------------------------------------------------------
+DB_PATH = "user_counts.db"
+
+def get_db_connection():
+    """
+    SQLite データベースへの接続を返す。
+    row_factory を設定して dict 風に取得できるようにする。
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    """
+    起動時に呼ぶ。テーブル user_counts を作成する（存在しなければ）。
+    user_id と date の複合主キーで、positive を整数型で保持。
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # テーブルを作り直す場合は次の行を有効化
+    # cursor.execute("DROP TABLE IF EXISTS user_counts")
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_counts (
+            user_id   TEXT,
+            date      TEXT,
+            positive  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, date)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def upsert_user_count(user_id: str, category: str, date: str = None):
+    """
+    指定した user_id, date の行がなければ INSERT
+    存在すれば、positive カラムに +1 して UPDATE する。
+    category が "positive" の場合のみ処理する。
+    date: 'YYYY-MM-DD' 形式。省略時は今日の日付。
+    """
+    if category != "positive":
+        return
+    if date is None:
+        date = datetime.utcnow().date().isoformat()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO user_counts(user_id, date, positive)
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, date) DO UPDATE SET positive = positive + 1
+    """, (user_id, date))
+    conn.commit()
+    conn.close()
+
+def fetch_all_counts(date: str = None):
+    """
+    日次レポート用に、指定日または全期間のすべてのユーザー行を dict にして返す。
+    返り値の構造: { user_id: { "positive": int }, ... }
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if date:
+        cursor.execute("SELECT user_id, SUM(positive) as positive FROM user_counts WHERE date = ? GROUP BY user_id", (date,))
+    else:
+        cursor.execute("SELECT user_id, SUM(positive) as positive FROM user_counts GROUP BY user_id")
+    rows = cursor.fetchall()
+    conn.close()
+
+    result = {}
+    for row in rows:
+        result[row["user_id"]] = {
+            "positive": row["positive"]
+        }
+    return result
+
+# -----------------------------------------------------------------------------
+# 3.5) 月次・日次表彰用関数
+# -----------------------------------------------------------------------------
+def fetch_top_users_by_month(month_str: str):
+    """
+    指定した年月 (YYYY-MM) における positive 発言数トップのユーザーを返す。
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT user_id, SUM(positive) as total_positive
+        FROM user_counts
+        WHERE strftime('%Y-%m', date) = ?
+        GROUP BY user_id
+        ORDER BY total_positive DESC
+        LIMIT 1
+    """, (month_str,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"user_id": row["user_id"], "total_positive": row["total_positive"]}
+    else:
+        return None
+
+def fetch_top_user_by_date(date_str: str):
+    """
+    指定した日付 (YYYY-MM-DD) における positive 発言数トップのユーザーを返す。
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT user_id, positive
+        FROM user_counts
+        WHERE date = ?
+        ORDER BY positive DESC
+        LIMIT 1
+    """, (date_str,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"user_id": row["user_id"], "positive": row["positive"]}
+    else:
+        return None
+
+# -----------------------------------------------------------------------------
+# 4) Slack Bolt アプリを初期化
+# -----------------------------------------------------------------------------
+bolt_app = BoltApp(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
+handler  = SlackRequestHandler(bolt_app)
+
+# -----------------------------------------------------------------------------
+# 5) メッセージイベントをキャッチして SQLite に upsert する
+# -----------------------------------------------------------------------------
+@bolt_app.event("message")
+def handle_all_messages(event, say, logger):
+    print(">>> handle_all_messages が呼ばれました")
+    user_id = event.get("user")
+    text    = event.get("text", "")
+
+    # Bot 自身のメッセージや user がない場合は無視
+    if not user_id or user_id == "USLACKBOT":
         return
 
-    try:
-        ngrok.set_auth_token(ngrok_token)
+    logger.info(f"[message] user={user_id} text={text}")
+    print(f">>> logger.info の直後： user={user_id}, text={text}")  
 
-        # 既存のngrokトンネルを閉じる
-        try:
-            tunnels = ngrok.get_tunnels()
-            if tunnels:
-                print(f"{len(tunnels)}個の既存トンネルが見つかりました。閉じています...")
-                for tunnel in tunnels:
-                    print(f"  - 切断中: {tunnel.public_url}")
-                    ngrok.disconnect(tunnel.public_url)
-                print("すべての既存ngrokトンネルを切断しました。")
-            else:
-                print("アクティブなngrokトンネルはありません。")
-        except Exception as e:
-            print(f"トンネル切断中にエラーが発生しました: {e}")
-            # エラーにもかかわらず続行を試みる
+    # 1) 分類
+    if is_prohibited(text):
+        say(text="⚠️ このメッセージは禁止行為に該当する可能性があります。")
+        logger.info(f"[禁止判定] {user_id} の発言が禁止と判定されました。")
+        return
+    category = llm_based_classify(text)
 
-        # 新しいngrokトンネルを開く
-        print(f"ポート{port}に新しいngrokトンネルを開いています...")
-        ngrok_tunnel = ngrok.connect(port)
-        public_url = ngrok_tunnel.public_url
-        print("---------------------------------------------------------------------")
-        print(f"✅ 公開URL:   {public_url}")
-        print(f"📖 APIドキュメント (Swagger UI): {public_url}/docs")
-        print(f"Slack Event Subscription の Request URL: {public_url}/slack/events")
-        print("---------------------------------------------------------------------")
-        print("(APIクライアントやブラウザからアクセスするためにこのURLをコピーしてください)")
-        uvicorn.run(fastapi_app, host="0.0.0.0", port=port, log_level="info")  # ログレベルをinfoに設定
+    if category == "positive":
+        today_str = datetime.utcnow().date().isoformat()
+        upsert_user_count(user_id, category, today_str)
+        current_counts = fetch_all_counts(today_str).get(user_id, {"positive": 0})
+        logger.info(f"[集計] {user_id} の {category} を +1 → 現在値 {current_counts}")
+    else:
+        logger.info(f"[集計] {user_id} の発言は POSITIVE ではないため集計しません。category={category}")
 
-    except Exception as e:
-        print(f"\n ngrokまたはUvicornの起動中にエラーが発生しました: {e}")
-        traceback.print_exc()
-        # エラー後に残る可能性のあるngrokトンネルを閉じようとする
-        try:
-            print("エラーにより残っている可能性のあるngrokトンネルを閉じています...")
-            tunnels = ngrok.get_tunnels()
-            for tunnel in tunnels:
-                ngrok.disconnect(tunnel.public_url)
-            print("ngrokトンネルを閉じました。")
-        except Exception as ne:
-            print(f"ngrokトンネルのクリーンアップ中に別のエラーが発生しました: {ne}")
+# -----------------------------------------------------------------------------
+# 7) APScheduler の設定
+# -----------------------------------------------------------------------------
+def setup_scheduler():
+    scheduler = AsyncIOScheduler()
+    # CronTrigger: UTC の 0:00 に実行。
+    # 日本時間0:00にしたい場合は UTC15:00（hour=15）とする。
+    trigger = CronTrigger(hour=15, minute=0)
+    # 表彰メッセージ send_award_report を定期実行
+    scheduler.add_job(send_award_report, trigger, id="award_report_job")
+    scheduler.start()
+    print("[Scheduler] 毎日 0:00 (UTC) に send_award_report を実行するよう設定しました。")
 
+# -----------------------------------------------------------------------------
+# 8) FastAPI アプリとルーティング
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Slackメッセージ集計 Bot (SQLite)", version="1.0")
 
-# --- Slackアプリの初期化 ---
-slack_app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
-app_handler = SlackRequestHandler(slack_app)
+@app.on_event("startup")
+async def startup_event():
+    # 1) SQLite テーブルを初期化
+    init_db()
+    print("[Startup] SQLite テーブル user_counts を初期化（存在しなければ作成）しました。")
 
-# --- Slackイベントの処理 ---
-@slack_app.event("app_mention")
-def handle_app_mentions(body, say):
-    print(body)
-    say("What's up?")
+    # 2) スケジューラを起動
+    setup_scheduler()
+    print("[Startup] APScheduler を起動しました。")
 
-# --- メイン実行ブロック ---
+    # 3) モデルをロード
+    load_model_task()
+    print("[Startup] モデルをロードしました。")
+
+@app.post("/slack/events")
+async def slack_events(request: Request):
+    """
+    - Slack の URL 検証 (type=url_verification) に対応
+    - それ以外は Bolt に委譲
+    """
+    body = await request.json()
+    if body.get("type") == "url_verification":
+        return JSONResponse(content={"challenge": body["challenge"]})
+    return await handler.handle(request)
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Slackメッセージ集計 Bot (SQLite) が動作中です。"}
+
+# -----------------------------------------------------------------------------
+# 8.5) /award エンドポイント: 日次・月次ランキング
+# -----------------------------------------------------------------------------
+@app.get("/award")
+async def award_top_users():
+    today = datetime.utcnow().date()
+    today_str = today.isoformat()
+    month_str = today.strftime('%Y-%m')
+    daily_top = fetch_top_user_by_date(today_str)
+    monthly_top = fetch_top_users_by_month(month_str)
+    return {
+        "daily_top": daily_top,
+        "monthly_top": monthly_top
+    }
+
+# -----------------------------------------------------------------------------
+# 9) メインブロック: uvicorn + ngrok（任意）起動
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # 指定されたポートでサーバーを起動
-    run_with_ngrok(port=8501)  # このポート番号を確認
-    # run_with_ngrokが終了したときにメッセージを表示
-    print("\nサーバープロセスが終了しました。")
+    port = 8000
+    # ngrok トークンがある場合はトンネルを作成
+    if NGROK_TOKEN:
+        from pyngrok import ngrok as _ngrok
+        _ngrok.set_auth_token(NGROK_TOKEN)
+        tunnel = _ngrok.connect(port)
+        print(f"✅ ngrok で公開中: {tunnel.public_url}")
+        print(f"  → Slack Event Subscription Request URL: {tunnel.public_url}/slack/events")
+
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
